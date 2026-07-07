@@ -4,7 +4,7 @@
 
 **技术栈**：Flink 1.19.1、Kafka 3.x、Doris 3.0.4、Redis 7.0、MySQL 8.0、Zookeeper 3.5.7、Superset、Docker
 
-**项目职责**：
+**项目流程**：
 1. **数仓分层建模**：设计 ODS→DWD→DWS→ADS 四层实时数仓架构，ODS 层通过 Kafka 采集 4 路业务数据流，DWD 层完成双流 join 关联与状态去重，DWS 层按商品/时间维度聚合 GMV/客单价/转化率/漏斗指标，ADS 层落地 4 个实时指标作业（1min GMV、商品排行、商品漏斗、运营总览）。
 2. **Flink 实时开发**：基于 EventTime 语义实现 8+ 个 Flink 作业，采用 TumblingEventTimeWindows + allowedLateness 处理乱序数据，使用 KeyedCoProcessFunction + ValueState 实现双流 join，解决漏斗流数据稀疏导致的窗口不匹配问题（GMV 驱动输出模式）。
 3. **维度关联与状态管理**：Redis 缓存商品维度表，异步 IO 关联实现毫秒级维度补全；设计订单状态机（CREATED→PAID→SHIPPED→REFUNDED）与注册用户池/活跃商品池，保证多流数据可关联性。
