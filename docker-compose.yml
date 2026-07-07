@@ -1,0 +1,217 @@
+services:
+  # ---------- Zookeeper (Kafka 依赖) ----------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc -w 2 localhost 2181 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ---------- Kafka ----------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INSIDE://0.0.0.0:9092,OUTSIDE://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INSIDE://kafka:9092,OUTSIDE://192.168.94.200:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INSIDE:PLAINTEXT,OUTSIDE:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INSIDE
+    # 单 Broker 必须将以下副本因子设为 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+
+# ---------- Flink JobManager ----------
+  jobmanager:
+    image: flink:1.19.1-scala_2.12-java11
+    container_name: jobmanager
+    ports:
+      - "8081:8081"
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+    command: jobmanager
+    volumes:                    
+      - /opt/programs/realtime-warehouse/flink-checkpoints:/opt/programs/realtime-warehouse/flink-checkpoints
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1.0G
+
+  # ---------- Flink TaskManager ----------
+  taskmanager:
+    image: flink:1.19.1-scala_2.12-java11
+    container_name: taskmanager
+    depends_on:
+      - jobmanager
+    environment:
+      - JOB_MANAGER_RPC_ADDRESS=jobmanager
+    command: taskmanager
+    volumes:                     
+      - /opt/programs/realtime-warehouse/flink-checkpoints:/opt/programs/realtime-warehouse/flink-checkpoints
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1.0G
+
+  # ---------- MySQL (结果存储 + 维表) ----------
+  mysql:
+    image: mysql:8.0.36
+    container_name: mysql
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: realtime_db
+      MYSQL_USER: flink
+      MYSQL_PASSWORD: flink123
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # ---------- Redis (维表缓存) ----------
+  redis:
+    image: redis:7.0.15   # 如果拉取失败，可换用 redis:7.0-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/opt/programs/redis-data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+
+  # ---------- 模拟数据生成器 (Python) ----------
+  data-generator:
+    image: python:3.9-slim
+    container_name: data-generator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./generator:/app
+    working_dir: /app
+    command: sh -c "pip install -r requirements.txt && python generator.py"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.2'
+          memory: 128M
+
+  doris-fe:
+    image: apache/doris:fe-3.0.4 # 建议使用3.0或更高版本的稳定镜像
+    container_name: doris-fe
+    hostname: doris-fe
+    networks:
+      doris_net:
+        ipv4_address: 172.20.0.2
+    environment:        
+      - FE_SERVERS=fe1:172.20.0.2:9010   # FE 自身 IP
+      - FE_ID=1
+#FE_SERVERS=fe1:172.22.0.2:9010 # 根据实际网络情况调整
+    ports:
+      - "9030:9030"  # MySQL 协议端口，用于连接
+      - "8030:8030"  # HTTP 协议端口，用于 Web UI 和 Stream Load
+    volumes:
+      - ./doris/fe/data:/opt/apache-doris/fe/doris-meta # 持久化 FE 元数据
+      - ./doris/fe/log:/opt/apache-doris/fe/log   
+    mem_limit: 2.5g
+  #  networks:
+   #   doris_net:
+    #    ipv4_address: 172.20.0.2
+
+  # Doris BE (Backend) 服务
+  doris-be:
+    image: apache/doris:be-3.0.4
+    container_name: doris-be
+    hostname: doris-be
+    networks:
+      doris_net:
+        ipv4_address: 172.20.0.3
+    depends_on:
+      - doris-fe
+    environment:
+      - FE_SERVERS=fe1:172.20.0.2:9010   # BE 使用 FE 的 IP
+      - BE_ADDR=172.20.0.3:9050 
+    ports:
+      - "8040:8040"  # BE 的 HTTP 端口
+      - "9050:9050"  # BE 的 Thrift 端口，用于 FE 与 BE 通信
+    volumes:
+      - ./doris/be/data:/opt/apache-doris/be/storage # 持久化 BE 数据
+      - ./doris/be/log:/opt/apache-doris/be/log3
+    mem_limit: 2.6g
+networks:
+  doris_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1
+volumes:
+  mysql_data:
+  redis_data:
